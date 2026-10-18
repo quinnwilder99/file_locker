@@ -1,0 +1,13 @@
+[package]
+name = "flk"
+description = "Command-line tool for file_locker vaults"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+vault-core = { path = "../vault-core" }
+zeroize = "1"

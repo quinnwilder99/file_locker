@@ -1,0 +1,2 @@
+# The committed test vault must stay byte-for-byte identical: no line-ending conversion.
+crates/vault-core/tests/fixtures/** -text

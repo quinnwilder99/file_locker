@@ -1,0 +1,23 @@
+{
+  "format": "file_locker-vault",
+  "version": 1,
+  "kdf": {
+    "memory_kib": 1024,
+    "iterations": 1,
+    "parallelism": 1
+  },
+  "slots": [
+    {
+      "kind": "password",
+      "salt": "Kv3ERXIL/ywczbMOHOP+2g==",
+      "nonce": "MSvgctpDExNz5mr3",
+      "wrapped_key": "6cIeXRysNznG8jrerjSYtrE8V6t//snlBLf+KO4PEGpAOaZAz81K3IemEZDdC6gv5S8Qm4ZSwvcVkQ05NsODLNUW7esRSu37TRZmCzFtzmw="
+    },
+    {
+      "kind": "recovery",
+      "salt": "GsrBXMJSaKLyJRwjcbbCnA==",
+      "nonce": "pDQvsrAig00wAwLc",
+      "wrapped_key": "kGK9/jlWQMxdRLw7tEY1Qk23a93oY1V178mApHq3Sd11wGQ+Fpuawf9XX2xl0dC65AfTqNDHi7FH4sdRlfyg7EQDjLd7ocm0hBduRcDtaQU="
+    }
+  ]
+}
