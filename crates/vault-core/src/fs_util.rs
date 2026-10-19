@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{hex, random_fill, Error, Result};
 
@@ -11,16 +11,7 @@ pub(crate) fn write_atomic_with<T>(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<T>,
 ) -> Result<T> {
-    let dir = path.parent().ok_or_else(|| {
-        Error::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path has no parent",
-        ))
-    })?;
-    let mut tag = [0u8; 8];
-    random_fill(&mut tag)?;
-    let tmp = dir.join(format!(".{}.tmp", hex(&tag)));
-
+    let tmp = temp_path_beside(path)?;
     let result: Result<T> = (|| {
         let file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         let mut writer = BufWriter::new(file);
@@ -35,6 +26,19 @@ pub(crate) fn write_atomic_with<T>(
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// A fresh temporary name in `path`'s folder. Listings skip these names.
+pub(crate) fn temp_path_beside(path: &Path) -> Result<PathBuf> {
+    let dir = path.parent().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path has no parent",
+        ))
+    })?;
+    let mut tag = [0u8; 8];
+    random_fill(&mut tag)?;
+    Ok(dir.join(format!(".{}.tmp", hex(&tag))))
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

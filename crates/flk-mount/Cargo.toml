@@ -1,0 +1,23 @@
+[package]
+name = "flk-mount"
+description = "Mounts a file_locker vault as a Windows drive through WinFsp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vault-core = { path = "../vault-core" }
+winfsp = { version = "0.13", features = ["system"] } # finds the installed WinFsp via the registry
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+winfsp = { version = "0.13", features = ["system"] } # finds the installed WinFsp via the registry
+
+[dev-dependencies]
+tempfile = "3"

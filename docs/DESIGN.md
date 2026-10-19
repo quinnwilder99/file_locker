@@ -15,7 +15,11 @@ without full BitLocker.
 - A lost or stolen laptop, disk or USB stick.
 - Someone reading the vault from another machine, another OS (Linux live USB), or with raw disk tools.
 - Someone on this PC while the vault is locked.
-- Tampering with vault contents (detected, see Crypto).
+- Tampering with vault contents: modified, truncated, reordered or extended file data, altered
+  names, and entries moved between folders are all detected (see Crypto). **Not** detected:
+  swapping two whole encrypted files with each other, or restoring an older copy of a file
+  (rollback). File contents are not bound to their name, which keeps renames cheap; Cryptomator
+  makes the same trade-off.
 
 **Does not protect against**
 - Malware or another user on the PC *while the vault is unlocked* (same as BitLocker).
@@ -84,7 +88,7 @@ so the swap is detected rather than silent.
 | Purpose | Choice | Notes |
 |---|---|---|
 | Password → key | **Argon2id**, default m = 256 MiB, t = 3, p = 4, 16-byte random salt | Params stored in `vault.json`. At creation, `t` is raised until one derivation takes ~1 s on that machine (capped at 32, never below the default). |
-| Master key | 64 random bytes from the OS CSPRNG | Split into content key and name key via HKDF-SHA-256. |
+| Master key | 64 random bytes from the OS CSPRNG | HKDF-SHA-256 derives three subkeys: content (wraps per-file keys), names (AES-SIV) and directory hashing (HMAC-SHA-256 for storage paths). |
 | Key slots | Master key wrapped with AES-256-GCM under each slot's key | Slot 1: password. Slot 2: recovery key. Changing the password rewraps only slot 1, no re-encryption. |
 | Recovery key | 32 random bytes, shown once as 52 Crockford-base32 chars + 4-char checksum, in 14 groups of 4 | Replaces "password recovery". Nothing in the vault can reveal the password. The checksum reports typos as typos instead of "wrong key". |
 | File contents | AES-256-GCM in 64 KiB chunks; file header holds a random 32-byte per-file key wrapped by the content key | Each chunk: fresh random 12-byte nonce + 16-byte tag (0.04 % overhead). AAD = header nonce ‖ chunk index ‖ last-chunk flag. The final chunk is always shorter than a full one (possibly empty), so chunks can't be swapped, reordered, truncated or appended to undetected. |
@@ -92,7 +96,11 @@ so the swap is detected rather than silent.
 
 Rules:
 - Never reuse a nonce: every chunk write draws a new random nonce, including rewrites.
-- Keys live in locked, non-pageable memory where possible, and are zeroized on lock.
+- Keys live in locked, non-pageable memory where possible, and are zeroized on lock. Implemented by
+  `SecretBytes`: each key (master, subkeys, KEKs, per-file keys, recovery key) gets its own page,
+  locked with `VirtualLock` and zeroized before being freed. The crypto crates' own `zeroize`
+  features are on, so AES/GHASH/CMAC key schedules and Argon2 working memory are wiped too.
+  Short-lived copies (the unwrapped key buffer, typed passwords) are wiped but not page-locked.
 - Header and `vault.json` parsing must reject anything unexpected (fuzzed, see Milestones).
 - No custom crypto primitives; use vetted libraries only.
 
@@ -108,7 +116,9 @@ Rules:
   the originals. The UI warns that deleted originals may remain recoverable, especially on SSDs, and
   recommends creating sensitive files inside the vault from the start.
 - **No WinFsp available** (e.g. a borrowed PC without admin rights): a CLI fallback can decrypt a
-  vault to a chosen folder or re-encrypt it, without mounting.
+  vault to a chosen folder or re-encrypt it, without mounting: `flk export`, edit, then
+  `flk import --replace`, which writes the new copy in full before removing the old one.
+  `flk rm` and `flk mv` delete and rename inside the vault.
 
 ## Lessons from LockDir (prior-art analysis)
 
@@ -140,13 +150,68 @@ The format is frozen by two kinds of test:
   Changing either means a new format version, not an edited vector.
 
 ```
-crates/vault-core   library: vault format, keys, content and name encryption
-crates/flk          CLI: create, import, export, ls, passwd, recover
+crates/vault-core   library: vault format, keys, content and name encryption, random-access files
+crates/flk-mount    WinFsp file system over vault-core
+crates/flk          CLI: create, import [--replace], export, ls, rm, mv, passwd, recover, mount
 ```
 
 Build and test: `cargo test --workspace`. CLI help: `cargo run -p flk -- --help`.
 `--password-stdin` reads secrets one per line for scripting (a leading UTF-8 BOM, which Windows
 PowerShell adds to piped text, is ignored).
+
+Build requirements (Windows): Visual Studio Build Tools with the C++ workload; WinFsp 2.1 with its
+**Developer** feature (`msiexec /i winfsp-2.1.msi ADDLOCAL=F.Main,F.User,F.Developer`); LLVM, for
+the libclang that generates the WinFsp bindings. Running `flk mount` needs only WinFsp itself.
+Mount tests skip themselves (with a message) when WinFsp is missing.
+
+### Mounted drive (`flk mount`)
+
+`flk mount <vault> [--drive V:] [--open]` unlocks the vault as a drive letter until Ctrl+C, then
+unmounts and drops the keys. If the process is killed, WinFsp removes the drive.
+
+How Windows semantics map onto the vault:
+- **Reads and writes at any offset** go through `VaultFile`, which re-encrypts only the 64 KiB
+  chunks a write touches (fresh nonce each time) and keeps the final-chunk rule, so every file stays
+  valid for whole-file decryption. Handles to the same file share one `VaultFile`.
+- **Case-insensitive, case-preserving names.** Exact spellings are found directly. Other spellings
+  use a per-folder index (case-folded name → stored name) that this vault keeps current as it
+  changes the folder, and rebuilds when the folder's modification time moves, so changes made from
+  outside (another process, a sync tool) are noticed. An outside change that lands in the same
+  timestamp tick as one of ours can be missed until the next change.
+- **Security descriptor:** every entry reports the current user as owner, with full control for the
+  user, SYSTEM and Administrators. Git requires the owner to be the current user. Permission
+  changes are accepted and dropped; the vault does not store ACLs.
+- **File index** (Windows' inode number) is a hash of the case-folded path. Tools compare it (tar
+  refuses to archive a file whose index matches the archive's), so it must be unique; it changes
+  when an entry is renamed.
+- **Timestamps** are the encrypted file's own NTFS times; setting them sets those.
+
+Not stored (yet): file attributes such as hidden, read-only or system; ACLs; alternate data streams;
+reparse points and hard links.
+
+Durability: a new file is not flushed to disk when created, and chunk rewrites are not atomic. An
+app's flush (`FlushFileBuffers`) syncs the file. A crash mid-write can leave the chunk being written
+failing authentication; the folder still lists, and opening that file reports the damage.
+
+Measured on the development machine (NVMe, release build, Defender on):
+
+| Workload | Plain NTFS | Mounted vault |
+|---|---|---|
+| Write / read 256 MB | 1,430 / 3,300 MB/s | 750 / 670 MB/s |
+| Create 1,000 × 4 KB files | 0.35 s | 4.3 s (linear in count) |
+| List 3,000 files | 0.03 s (1,000) | 0.23 s |
+| 2,000 random 4 KB writes into a 256 MB file | 0.03 s | 0.6 s |
+
+Windows Defender scans every new random-looking file the first time it is opened (~8 ms on this
+machine). The vault already avoids reopening files it just created. Excluding the **vault folder**
+(not the mounted drive) from real-time scanning removes the rest of that cost; it is safe because
+the ciphertext cannot be meaningfully scanned, and files are still scanned in plaintext when apps
+open them on the mounted drive. This is a user choice; `flk` does not change Defender settings.
+
+Tested with real tools on a mounted vault (`crates/flk-mount/tests/real_tools.rs`): robocopy
+(multithreaded copy, byte-exact), git (commit, `gc --aggressive`, `fsck --full --strict`, checkout),
+Windows tar and 7-Zip (archive, test, extract, byte-exact). Not yet tested: Microsoft Office (not
+installed on the development machine) and interactive use in Explorer.
 
 ## Open decisions
 
@@ -154,16 +219,22 @@ PowerShell adds to piped text, is ignored).
    structurally similar. Matching Cryptomator exactly would let users open vaults with an existing
    audited tool, at the cost of its KDF choice and recovery-key format.
 2. **WinFsp installation.** Bundle the official signed installer with ours, or require it separately.
-3. **Case-insensitive lookup** (milestone 2). Windows treats `A.txt` and `a.txt` as the same file;
-   encrypted names do not. The mount layer must make lookups case-insensitive.
+3. **Attributes.** Store hidden / read-only / system attributes (e.g. in the file header or a
+   sidecar), or keep reporting every file as a plain archive file.
 
 ## Milestones
 
-1. **Core + CLI** ✅ (2026-10-18): vault format, key slots, file and name crypto, `create / import /
-   export / ls / passwd / recover`, long-name shortening, KDF calibration (~1 s unlock), format
-   frozen by known-answer vectors and a committed fixture vault. 34 tests: round-trip, tamper,
-   at-rest leak, recovery, long names, interrupted writes, lost empty folders.
-2. **Mount:** WinFsp filesystem over the core; stress test with real apps (Office, git, 7-Zip).
+1. **Core + CLI** ✅ (2026-10-18): vault format, key slots, file and name crypto, `create / import
+   [--replace] / export / ls / rm / mv / passwd / recover`, long-name shortening, KDF calibration
+   (~1 s unlock), page-locked zeroized keys, format frozen by known-answer vectors and a committed
+   fixture vault. 40 tests: round-trip, tamper, at-rest leak, recovery, long names, interrupted
+   writes, lost empty folders, remove/rename/replace, memory locking.
+2. **Mount** ✅ (2026-10-18): WinFsp file system over the core (`flk-mount`), `flk mount` with
+   Ctrl+C to lock, random-access `VaultFile`, case-insensitive lookup with a per-folder index,
+   shared handles, rename-and-replace, delete-on-close. 52 tests in all, including a randomized
+   model test of `VaultFile`, a live mount driven through `std::fs`, real tools (robocopy, git,
+   tar, 7-Zip) and an end-to-end CLI test that locks with Ctrl+Break. Open items: Office and
+   Explorer testing by hand, attributes (see Open decisions), per-file overhead of ~4 ms.
 3. **Desktop app:** tray icon, unlock dialog, auto-lock triggers, Explorer context menu, installer.
 4. **Hardening:** fuzz `vault.json` and file-header parsing, crash-consistency tests (power loss
    mid-write), external review of the crypto design before any 1.0.

@@ -27,8 +27,14 @@ pub enum Error {
     #[error("{0} not found in the vault")]
     NotFound(String),
 
+    #[error("{0} is a folder")]
+    IsADirectory(String),
+
     #[error("{0} is not a folder")]
     NotADirectory(String),
+
+    #[error("cannot {0}")]
+    NotAllowed(&'static str),
 
     #[error("invalid name {0:?}")]
     InvalidName(String),

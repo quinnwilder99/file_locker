@@ -10,11 +10,15 @@
 //!     <hash>.flks/dir.id             the file contents or the folder ID
 //! ```
 
-use std::fs::{self, File};
+use std::collections::HashMap;
+use std::fs::{self, File, Metadata};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::config::{slot_aad, KeySlot, SlotKind, VaultConfig};
+use crate::content::VaultFile;
 use crate::fs_util::{exists, is_empty_dir, write_atomic, write_atomic_with};
 use crate::keys::{self, KdfParams, MasterKey, RecoveryKey, VaultKeys, SALT_LEN};
 use crate::names::{self, StoredName, ENTRY_SUFFIX, SHORTENED_SUFFIX};
@@ -37,6 +41,24 @@ pub struct Entry {
     pub kind: EntryKind,
     /// Plaintext size; `None` for folders.
     pub size: Option<u64>,
+    /// Timestamps of the encrypted file (or the folder's entry) on disk.
+    pub created: SystemTime,
+    pub modified: SystemTime,
+    pub accessed: SystemTime,
+}
+
+impl Entry {
+    fn new(name: String, kind: EntryKind, size: Option<u64>, meta: &Metadata) -> Self {
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        Self {
+            name,
+            kind,
+            size,
+            created: meta.created().unwrap_or(modified),
+            modified,
+            accessed: meta.accessed().unwrap_or(modified),
+        }
+    }
 }
 
 /// Totals from an import or export.
@@ -55,6 +77,16 @@ pub struct Vault {
     config: VaultConfig,
     master: MasterKey,
     keys: VaultKeys,
+    /// Per folder ID: case-folded name → stored name, for [`Vault::find`].
+    name_index: Mutex<HashMap<String, FolderIndex>>,
+}
+
+/// A folder's names, valid while its storage folder's modification time is
+/// unchanged (so changes made outside this vault object, such as by a sync
+/// tool, are noticed). This vault's own changes drop it explicitly.
+struct FolderIndex {
+    stamp: SystemTime,
+    names: Arc<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -193,13 +225,219 @@ impl Vault {
     /// keeping its name. Fails if that name already exists there.
     pub fn import(&self, source: &Path, dest: &str) -> Result<Stats> {
         let parent = self.resolve_dir(&split_path(dest)?, dest)?;
-        let name = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| Error::InvalidName(source.display().to_string()))?;
         let mut stats = Stats::default();
-        self.import_entry(source, &parent, name, &mut stats)?;
+        self.import_entry(source, &parent, source_name(source)?, &mut stats)?;
         Ok(stats)
+    }
+
+    /// Like [`import`](Self::import), but replaces an existing file or folder
+    /// of the same name. The new copy is written in full under a temporary
+    /// name before the old one is removed, so a failure never loses the old copy.
+    pub fn import_replacing(&self, source: &Path, dest: &str) -> Result<Stats> {
+        let parent = self.resolve_dir(&split_path(dest)?, dest)?;
+        let name = source_name(source)?;
+        let existing = self.node(&parent, name)?;
+        let Some(old_kind) = existing.kind()? else {
+            return self.import(source, dest);
+        };
+
+        let mut tag = [0u8; 8];
+        random_fill(&mut tag)?;
+        let temp_name = format!("~flk-replacing-{}", hex(&tag));
+        let mut stats = Stats::default();
+        if let Err(e) = self.import_entry(source, &parent, &temp_name, &mut stats) {
+            let temp = self.node(&parent, &temp_name)?;
+            if let Ok(Some(kind)) = temp.kind() {
+                let _ = self.remove_node(&temp, kind, &mut Stats::default());
+            }
+            self.forget_index(&parent.id);
+            return Err(e);
+        }
+        let temp = self.node(&parent, &temp_name)?;
+        let new_kind = temp
+            .kind()?
+            .ok_or_else(|| Error::Corrupt(format!("{temp_name} vanished while importing")))?;
+        self.remove_node(&existing, old_kind, &mut Stats::default())?;
+        self.move_node(&temp, new_kind, &existing)?;
+        self.forget_index(&parent.id);
+        Ok(stats)
+    }
+
+    /// Deletes a vault file, or a folder and everything in it.
+    pub fn remove(&self, path: &str) -> Result<Stats> {
+        let components = split_path(path)?;
+        let (name, parents) = components
+            .split_last()
+            .ok_or(Error::NotAllowed("remove the vault root"))?;
+        let parent = self.resolve_dir(parents, path)?;
+        let node = self.node(&parent, name)?;
+        let kind = node.kind()?.ok_or_else(|| Error::NotFound(path.into()))?;
+        let mut stats = Stats::default();
+        self.remove_node(&node, kind, &mut stats)?;
+        self.index_changed(&parent, None, Some(name));
+        Ok(stats)
+    }
+
+    /// Renames or moves a vault file or folder to the full path `to`, which
+    /// must not exist. File contents are not re-encrypted.
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.rename_with(from, to, false)
+    }
+
+    /// Like [`rename`](Self::rename); with `replace`, an existing *file* at
+    /// `to` is replaced (as Windows' rename-and-replace does). Folders are never
+    /// replaced.
+    pub fn rename_with(&self, from: &str, to: &str, replace: bool) -> Result<()> {
+        let from_parts = split_path(from)?;
+        let to_parts = split_path(to)?;
+        let ((from_name, from_parents), (to_name, to_parents)) =
+            match (from_parts.split_last(), to_parts.split_last()) {
+                (Some(f), Some(t)) => (f, t),
+                _ => return Err(Error::NotAllowed("move the vault root")),
+            };
+        let src_parent = self.resolve_dir(from_parents, from)?;
+        let src = self.node(&src_parent, from_name)?;
+        let kind = src.kind()?.ok_or_else(|| Error::NotFound(from.into()))?;
+        if kind == EntryKind::Dir
+            && to_parts.len() > from_parts.len()
+            && to_parts.starts_with(&from_parts)
+        {
+            return Err(Error::NotAllowed("move a folder into itself"));
+        }
+        let dst_parent = self.resolve_dir(to_parents, to)?;
+        let dst = self.node(&dst_parent, to_name)?;
+        match dst.kind()? {
+            None => {}
+            Some(_) if from_parts == to_parts => return Ok(()),
+            Some(EntryKind::File) if replace => {
+                self.remove_node(&dst, EntryKind::File, &mut Stats::default())?
+            }
+            Some(EntryKind::Dir) if replace => {
+                return Err(Error::NotAllowed("replace a folder"));
+            }
+            Some(_) => return Err(Error::AlreadyExists(to.into())),
+        }
+        fs::create_dir_all(&dst_parent.storage)?;
+        self.move_node(&src, kind, &dst)?;
+        self.index_changed(&src_parent, None, Some(from_name));
+        self.index_changed(&dst_parent, Some(to_name), None);
+        Ok(())
+    }
+
+    /// Details of one file or folder; the root is a folder named "".
+    pub fn stat(&self, path: &str) -> Result<Entry> {
+        let components = split_path(path)?;
+        let Some((name, parents)) = components.split_last() else {
+            let meta = fs::metadata(&self.root)?;
+            return Ok(Entry::new(String::new(), EntryKind::Dir, None, &meta));
+        };
+        let node = self.node(&self.resolve_dir(parents, path)?, name)?;
+        let kind = node.kind()?.ok_or_else(|| Error::NotFound(path.into()))?;
+        self.entry(name.to_string(), kind, &node)
+    }
+
+    /// Finds `path` ignoring letter case, as Windows does. Returns the path
+    /// with each component spelled as stored (`/` for the root), or `None`.
+    ///
+    /// Exact matches are cheap; other spellings use a per-folder index that
+    /// is built once and reused until the folder changes.
+    pub fn find(&self, path: &str) -> Result<Option<String>> {
+        let components = split_path(path)?;
+        let mut dir = self.root_dir();
+        let mut found = String::new();
+        for (i, name) in components.iter().enumerate() {
+            let exact = self.node(&dir, name)?;
+            let (stored, node, kind) = match exact.kind()? {
+                Some(kind) => (name.to_string(), exact, kind),
+                None => {
+                    let Some(stored) = self.folder_index(&dir)?.get(&fold(name)).cloned() else {
+                        return Ok(None);
+                    };
+                    let node = self.node(&dir, &stored)?;
+                    let Some(kind) = node.kind()? else {
+                        return Ok(None);
+                    };
+                    (stored, node, kind)
+                }
+            };
+            found.push('/');
+            found.push_str(&stored);
+            if i + 1 < components.len() {
+                if kind != EntryKind::Dir {
+                    return Ok(None);
+                }
+                dir = self.open_dir(&node)?;
+            }
+        }
+        Ok(Some(if found.is_empty() { "/".into() } else { found }))
+    }
+
+    /// Creates an empty file and returns it open. Fails if the name exists.
+    pub fn create_file(&self, path: &str) -> Result<VaultFile> {
+        let (parent, name) = self.parent_and_name(path)?;
+        let node = self.node(&parent, name)?;
+        if node.kind()?.is_some() {
+            return Err(Error::AlreadyExists(path.into()));
+        }
+        fs::create_dir_all(&parent.storage)?;
+        node.prepare()?;
+        let file = VaultFile::create(&self.keys.content, &node.contents())?;
+        self.index_changed(&parent, Some(name), None);
+        Ok(file)
+    }
+
+    /// Creates an empty folder. Fails if the name exists.
+    pub fn create_dir(&self, path: &str) -> Result<()> {
+        let (parent, name) = self.parent_and_name(path)?;
+        self.make_dir(&parent, name).map(|_| ())
+    }
+
+    /// Opens a file for reads and writes at any offset.
+    pub fn open_file(&self, path: &str) -> Result<VaultFile> {
+        let (parent, name) = self.parent_and_name(path)?;
+        let node = self.node(&parent, name)?;
+        match node.kind()? {
+            Some(EntryKind::File) => VaultFile::open(&self.keys.content, &node.contents()),
+            Some(EntryKind::Dir) => Err(Error::IsADirectory(path.into())),
+            None => Err(Error::NotFound(path.into())),
+        }
+    }
+
+    /// Sets timestamps; `None` leaves one unchanged.
+    pub fn set_times(
+        &self,
+        path: &str,
+        created: Option<SystemTime>,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> Result<()> {
+        let target = match split_path(path)?.split_last() {
+            None => self.root.clone(),
+            Some((name, parents)) => {
+                let node = self.node(&self.resolve_dir(parents, path)?, name)?;
+                match node.kind()? {
+                    Some(EntryKind::File) => node.contents(),
+                    Some(EntryKind::Dir) => node.path,
+                    None => return Err(Error::NotFound(path.into())),
+                }
+            }
+        };
+        let mut times = fs::FileTimes::new();
+        if let Some(t) = accessed {
+            times = times.set_accessed(t);
+        }
+        if let Some(t) = modified {
+            times = times.set_modified(t);
+        }
+        #[cfg(windows)]
+        if let Some(t) = created {
+            use std::os::windows::fs::FileTimesExt;
+            times = times.set_created(t);
+        }
+        #[cfg(not(windows))]
+        let _ = created;
+        open_for_attributes(&target)?.set_times(times)?;
+        Ok(())
     }
 
     /// Decrypts the vault file or folder `path` into `dest`, which must be
@@ -237,6 +475,7 @@ impl Vault {
             config,
             master,
             keys,
+            name_index: Mutex::new(HashMap::new()),
         }
     }
 
@@ -338,17 +577,127 @@ impl Vault {
                 &dir.id,
                 node.long_name.as_deref().unwrap_or(stored),
             )?;
-            let size = match kind {
-                EntryKind::Dir => None,
-                EntryKind::File => Some(
-                    content::plaintext_len(fs::metadata(node.contents())?.len())
-                        .ok_or_else(|| Error::Corrupt(format!("{name} has an impossible size")))?,
-                ),
-            };
-            entries.push((Entry { name, kind, size }, node));
+            entries.push((self.entry(name, kind, &node)?, node));
         }
         entries.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         Ok(entries)
+    }
+
+    /// Case-folded name → stored name for every entry in `dir`.
+    fn folder_index(&self, dir: &DirRef) -> Result<Arc<HashMap<String, String>>> {
+        // Read the stamp before listing: a change during the listing moves
+        // it, so the next lookup rebuilds.
+        let stamp = match fs::metadata(&dir.storage) {
+            Ok(meta) => meta.modified().ok(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(stamp) = stamp {
+            if let Some(index) = self.name_index.lock().unwrap().get(&dir.id) {
+                if index.stamp == stamp {
+                    return Ok(index.names.clone());
+                }
+            }
+        }
+        let names: Arc<HashMap<String, String>> = Arc::new(
+            self.read_names(dir)?
+                .into_iter()
+                .map(|name| (fold(&name), name))
+                .collect(),
+        );
+        if let Some(stamp) = stamp {
+            self.name_index.lock().unwrap().insert(
+                dir.id.clone(),
+                FolderIndex {
+                    stamp,
+                    names: names.clone(),
+                },
+            );
+        }
+        Ok(names)
+    }
+
+    fn forget_index(&self, dir_id: &str) {
+        self.name_index.lock().unwrap().remove(dir_id);
+    }
+
+    /// Keeps a folder's cached index current after this vault added or
+    /// removed one of its names, instead of rebuilding it from disk.
+    ///
+    /// The index adopts the folder's new modification time, so an outside
+    /// change landing at the same moment can be missed until the next one.
+    fn index_changed(&self, dir: &DirRef, added: Option<&str>, removed: Option<&str>) {
+        let mut cache = self.name_index.lock().unwrap();
+        let Some(index) = cache.get_mut(&dir.id) else {
+            return;
+        };
+        match fs::metadata(&dir.storage).and_then(|m| m.modified()) {
+            Ok(stamp) => {
+                let names = Arc::make_mut(&mut index.names);
+                if let Some(name) = removed {
+                    names.remove(&fold(name));
+                }
+                if let Some(name) = added {
+                    names.insert(fold(name), name.to_string());
+                }
+                index.stamp = stamp;
+            }
+            Err(_) => {
+                cache.remove(&dir.id);
+            }
+        }
+    }
+
+    /// Decrypted names in `dir`, without checking each entry on disk.
+    fn read_names(&self, dir: &DirRef) -> Result<Vec<String>> {
+        let items = match fs::read_dir(&dir.storage) {
+            Ok(items) => items,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut names = Vec::new();
+        for item in items {
+            let item = item?;
+            let file_name = item.file_name();
+            let Some(stored) = file_name.to_str() else {
+                continue;
+            };
+            let full = if stored.ends_with(ENTRY_SUFFIX) {
+                stored.to_string()
+            } else if stored.ends_with(SHORTENED_SUFFIX) {
+                match fs::read_to_string(item.path().join(LONG_NAME_FILE)) {
+                    Ok(full) => full,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                continue;
+            };
+            names.push(names::decrypt_name(&self.keys.names, &dir.id, &full)?);
+        }
+        Ok(names)
+    }
+
+    fn entry(&self, name: String, kind: EntryKind, node: &Node) -> Result<Entry> {
+        Ok(match kind {
+            EntryKind::Dir => Entry::new(name, kind, None, &fs::metadata(&node.path)?),
+            EntryKind::File => {
+                let meta = fs::metadata(node.contents())?;
+                // A damaged file (e.g. cut short by a crash) must not hide its
+                // folder's other entries: list it as empty, and opening it
+                // reports the damage.
+                let size = content::plaintext_len(meta.len()).unwrap_or(0);
+                Entry::new(name, kind, Some(size), &meta)
+            }
+        })
+    }
+
+    fn parent_and_name<'p>(&self, path: &'p str) -> Result<(DirRef, &'p str)> {
+        let components = split_path(path)?;
+        let (name, parents) = components
+            .split_last()
+            .ok_or(Error::NotAllowed("use the vault root as a file"))?;
+        Ok((self.resolve_dir(parents, path)?, name))
     }
 
     fn make_dir(&self, parent: &DirRef, name: &str) -> Result<DirRef> {
@@ -369,6 +718,7 @@ impl Vault {
             fs::create_dir_all(&node.path)?;
         }
         write_atomic(&node.dir_id(), child.id.as_bytes())?;
+        self.index_changed(parent, Some(name), None);
         Ok(child)
     }
 
@@ -403,9 +753,60 @@ impl Vault {
             stats.bytes += write_atomic_with(&node.contents(), |w| {
                 content::encrypt(&self.keys.content, input, w)
             })?;
+            self.index_changed(parent, Some(name), None);
             stats.files += 1;
         } else {
             stats.skipped.push(source.into());
+        }
+        Ok(())
+    }
+
+    /// Deletes children first, so an interrupted delete leaves a smaller but
+    /// consistent tree rather than unreachable storage.
+    fn remove_node(&self, node: &Node, kind: EntryKind, stats: &mut Stats) -> Result<()> {
+        match kind {
+            EntryKind::Dir => {
+                let dir = self.open_dir(node)?;
+                for (entry, child) in self.read_dir(&dir)? {
+                    self.remove_node(&child, entry.kind, stats)?;
+                }
+                remove_storage(&dir.storage)?;
+                self.forget_index(&dir.id);
+                stats.dirs += 1;
+                fs::remove_dir_all(&node.path)?;
+            }
+            EntryKind::File => {
+                stats.files += 1;
+                match node.long_name {
+                    Some(_) => fs::remove_dir_all(&node.path)?,
+                    None => fs::remove_file(&node.path)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves `src` to the empty location `dst`. Only the file contents or the
+    /// folder's `dir.id` move; a folder's children stay in its storage folder.
+    fn move_node(&self, src: &Node, kind: EntryKind, dst: &Node) -> Result<()> {
+        match kind {
+            EntryKind::File => {
+                dst.prepare()?;
+                fs::rename(src.contents(), dst.contents())?;
+            }
+            EntryKind::Dir => {
+                if dst.long_name.is_some() {
+                    dst.prepare()?;
+                } else {
+                    fs::create_dir_all(&dst.path)?;
+                }
+                fs::rename(src.dir_id(), dst.dir_id())?;
+            }
+        }
+        // Whatever is left of `src` (an empty folder, or one holding only
+        // name.flk) is incomplete and already ignored; tidy it up.
+        if src.path.is_dir() {
+            fs::remove_dir_all(&src.path)?;
         }
         Ok(())
     }
@@ -463,6 +864,48 @@ fn recovery_slot(master: &MasterKey, recovery: &RecoveryKey) -> Result<KeySlot> 
         nonce,
         wrapped_key,
     })
+}
+
+/// Case-folds a name by Unicode upper case, close to how Windows compares names.
+fn fold(name: &str) -> String {
+    name.chars().flat_map(char::to_uppercase).collect()
+}
+
+/// Opens a file or folder just to change its timestamps.
+fn open_for_attributes(path: &Path) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // required to open folders
+        options
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    #[cfg(not(windows))]
+    options.write(true);
+    Ok(options.open(path)?)
+}
+
+fn source_name(source: &Path) -> Result<&str> {
+    source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::InvalidName(source.display().to_string()))
+}
+
+/// Removes a folder's storage, then its `d/XX` parent if that is now empty.
+fn remove_storage(storage: &Path) -> Result<()> {
+    match fs::remove_dir_all(storage) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(parent) = storage.parent() {
+        let _ = fs::remove_dir(parent); // fails harmlessly unless empty
+    }
+    Ok(())
 }
 
 fn split_path(path: &str) -> Result<Vec<&str>> {

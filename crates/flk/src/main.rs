@@ -15,7 +15,14 @@ const MIN_PASSWORD_CHARS: usize = 8;
 const KDF_TARGET: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
-#[command(name = "flk", version, about = "Encrypted folder vaults")]
+#[command(
+    name = "flk",
+    version,
+    about = "Encrypted folder vaults",
+    after_help = "Paths inside a vault use / or \\ and may omit the leading /. \
+                  In Git Bash, write proj/a.txt rather than /proj/a.txt: \
+                  Git Bash rewrites arguments that start with /."
+)]
 struct Cli {
     /// Read passwords and recovery keys from stdin, one per line, instead of prompting.
     #[arg(long, global = true)]
@@ -36,6 +43,9 @@ enum Command {
         /// Vault folder to import into.
         #[arg(long, default_value = "/")]
         to: String,
+        /// Replace a file or folder of the same name (e.g. after editing an export).
+        #[arg(long)]
+        replace: bool,
     },
     /// Decrypt a vault file or folder into a new folder on disk.
     Export {
@@ -52,6 +62,24 @@ enum Command {
         path: String,
         #[arg(short, long)]
         recursive: bool,
+    },
+    /// Unlock the vault as a drive letter until Ctrl+C, then lock it.
+    Mount {
+        vault: PathBuf,
+        /// Drive letter to use, like V: (default: the highest free letter).
+        #[arg(long)]
+        drive: Option<String>,
+        /// Open the drive in Explorer once it is mounted.
+        #[arg(long)]
+        open: bool,
+    },
+    /// Delete a file, or a folder and everything in it, from the vault.
+    Rm { vault: PathBuf, path: String },
+    /// Rename or move a file or folder inside the vault.
+    Mv {
+        vault: PathBuf,
+        from: String,
+        to: String,
     },
     /// Change the vault password.
     Passwd { vault: PathBuf },
@@ -75,12 +103,35 @@ fn run(cli: Cli) -> Result<()> {
     };
     match cli.command {
         Command::Create { vault } => create(&vault, &input),
-        Command::Import { vault, source, to } => {
+        Command::Import {
+            vault,
+            source,
+            to,
+            replace,
+        } => {
             let vault = unlock(&vault, &input)?;
-            let stats = vault
-                .import(&source, &to)
-                .with_context(|| format!("importing {}", source.display()))?;
+            let stats = if replace {
+                vault.import_replacing(&source, &to)
+            } else {
+                vault.import(&source, &to)
+            }
+            .with_context(|| format!("importing {}", source.display()))?;
             report("Imported", &stats);
+            Ok(())
+        }
+        Command::Mount { vault, drive, open } => mount(&vault, drive, open, &input),
+        Command::Rm { vault, path } => {
+            let stats = unlock(&vault, &input)?
+                .remove(&path)
+                .with_context(|| format!("removing {path}"))?;
+            println!("Removed {} files and {} folders.", stats.files, stats.dirs);
+            Ok(())
+        }
+        Command::Mv { vault, from, to } => {
+            unlock(&vault, &input)?
+                .rename(&from, &to)
+                .with_context(|| format!("moving {from} to {to}"))?;
+            println!("Moved {from} to {to}.");
             Ok(())
         }
         Command::Export { vault, dest, from } => {
@@ -140,6 +191,30 @@ fn create(path: &Path, input: &SecretInput) -> Result<()> {
         }
         println!("Recovery key confirmed.");
     }
+    Ok(())
+}
+
+fn mount(path: &Path, drive: Option<String>, open: bool, input: &SecretInput) -> Result<()> {
+    let drive = match drive {
+        Some(d) => format!("{}:", d.trim_end_matches([':', '\\', '/']).to_uppercase()),
+        None => flk_mount::free_drive_letter().context("no free drive letter")?,
+    };
+    let vault = unlock(path, input)?;
+    let mounted = flk_mount::mount(vault, &drive)?;
+    println!("Unlocked at {drive}\\  Press Ctrl+C to lock.");
+    if open {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(format!("{drive}\\"))
+            .spawn();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .context("installing the Ctrl+C handler")?;
+    let _ = rx.recv();
+    mounted.unmount();
+    println!("Locked.");
     Ok(())
 }
 

@@ -10,8 +10,10 @@ mod format_vectors;
 mod fs_util;
 mod keys;
 mod names;
+mod secret;
 mod vault;
 
+pub use content::VaultFile;
 pub use error::{Error, Result};
 pub use keys::{KdfParams, RecoveryKey};
 pub use vault::{Entry, EntryKind, Stats, Vault};

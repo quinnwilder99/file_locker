@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::encoding::{crockford_decode, crockford_encode, crockford_normalize};
+use crate::secret::SecretBytes;
 use crate::{random_fill, Error, Result};
 
 /// Cap for calibration, well inside `validate`'s bound of 64, so a slow
@@ -72,12 +73,12 @@ impl KdfParams {
     }
 }
 
-pub(crate) struct MasterKey(Zeroizing<[u8; MASTER_KEY_LEN]>);
+pub(crate) struct MasterKey(SecretBytes<MASTER_KEY_LEN>);
 
 impl MasterKey {
     pub(crate) fn generate() -> Result<Self> {
-        let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-        random_fill(&mut *key)?;
+        let mut key = SecretBytes::zeroed();
+        random_fill(&mut key[..])?;
         Ok(Self(key))
     }
 
@@ -89,27 +90,27 @@ impl MasterKey {
 /// Independent subkeys derived from the master key with HKDF-SHA-256.
 pub(crate) struct VaultKeys {
     /// Wraps each file's random content key.
-    pub(crate) content: Zeroizing<[u8; 32]>,
+    pub(crate) content: SecretBytes<32>,
     /// AES-SIV-256 key for file and folder names.
-    pub(crate) names: Zeroizing<[u8; 64]>,
+    pub(crate) names: SecretBytes<64>,
     /// HMAC key that maps folder IDs to storage paths.
-    pub(crate) dir_hash: Zeroizing<[u8; 32]>,
+    pub(crate) dir_hash: SecretBytes<32>,
 }
 
 impl VaultKeys {
     pub(crate) fn derive(master: &MasterKey) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(b"file_locker vault v1"), master.as_bytes());
         let mut keys = VaultKeys {
-            content: Zeroizing::new([0; 32]),
-            names: Zeroizing::new([0; 64]),
-            dir_hash: Zeroizing::new([0; 32]),
+            content: SecretBytes::zeroed(),
+            names: SecretBytes::zeroed(),
+            dir_hash: SecretBytes::zeroed(),
         };
         // Output lengths are far below HKDF's 255 * 32 byte limit.
-        hk.expand(b"content", &mut *keys.content)
+        hk.expand(b"content", &mut keys.content[..])
             .expect("valid HKDF length");
-        hk.expand(b"names", &mut *keys.names)
+        hk.expand(b"names", &mut keys.names[..])
             .expect("valid HKDF length");
-        hk.expand(b"dir-hash", &mut *keys.dir_hash)
+        hk.expand(b"dir-hash", &mut keys.dir_hash[..])
             .expect("valid HKDF length");
         keys
     }
@@ -119,7 +120,7 @@ pub(crate) fn password_kek(
     password: &[u8],
     salt: &[u8],
     kdf: &KdfParams,
-) -> Result<Zeroizing<[u8; KEK_LEN]>> {
+) -> Result<SecretBytes<KEK_LEN>> {
     kdf.validate()?;
     let params = Params::new(
         kdf.memory_kib,
@@ -128,18 +129,18 @@ pub(crate) fn password_kek(
         Some(KEK_LEN),
     )
     .map_err(|_| Error::InvalidKdf(*kdf))?;
-    let mut kek = Zeroizing::new([0u8; KEK_LEN]);
+    let mut kek = SecretBytes::zeroed();
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(password, salt, &mut *kek)
+        .hash_password_into(password, salt, &mut kek[..])
         .map_err(|_| Error::InvalidKdf(*kdf))?;
     Ok(kek)
 }
 
 /// The recovery key is 256 random bits, so a fast KDF is enough.
-pub(crate) fn recovery_kek(recovery: &RecoveryKey, salt: &[u8]) -> Zeroizing<[u8; KEK_LEN]> {
-    let mut kek = Zeroizing::new([0u8; KEK_LEN]);
+pub(crate) fn recovery_kek(recovery: &RecoveryKey, salt: &[u8]) -> SecretBytes<KEK_LEN> {
+    let mut kek = SecretBytes::zeroed();
     Hkdf::<Sha256>::new(Some(salt), &recovery.0[..])
-        .expand(b"file_locker recovery slot v1", &mut *kek)
+        .expand(b"file_locker recovery slot v1", &mut kek[..])
         .expect("valid HKDF length");
     kek
 }
@@ -179,12 +180,7 @@ pub(crate) fn unwrap_master(
             .decrypt(&Nonce::from(nonce), Payload { msg: wrapped, aad })
             .ok()?,
     );
-    let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-    if plain.len() != MASTER_KEY_LEN {
-        return None;
-    }
-    key.copy_from_slice(&plain);
-    Some(MasterKey(key))
+    SecretBytes::from_slice(&plain).map(MasterKey)
 }
 
 /// A 256-bit recovery key, shown to the user once when the vault is created.
@@ -192,15 +188,15 @@ pub(crate) fn unwrap_master(
 /// Display form: 52 Crockford base32 characters of key plus a 4-character
 /// checksum, in 14 groups of 4 separated by dashes. The checksum lets typos be
 /// reported as typos instead of as a wrong key.
-pub struct RecoveryKey(Zeroizing<[u8; 32]>);
+pub struct RecoveryKey(SecretBytes<32>);
 
 const RECOVERY_BODY_CHARS: usize = 52;
 const RECOVERY_CHECK_CHARS: usize = 4;
 
 impl RecoveryKey {
     pub(crate) fn generate() -> Result<Self> {
-        let mut key = Zeroizing::new([0u8; 32]);
-        random_fill(&mut *key)?;
+        let mut key = SecretBytes::zeroed();
+        random_fill(&mut key[..])?;
         Ok(Self(key))
     }
 
@@ -223,7 +219,12 @@ impl RecoveryKey {
                 .filter(|c| !c.is_whitespace() && *c != '-')
                 .collect(),
         );
-        if cleaned.chars().count() != RECOVERY_BODY_CHARS + RECOVERY_CHECK_CHARS {
+        if !cleaned.is_ascii() {
+            return Err(Error::InvalidRecoveryKey(
+                "contains characters that cannot appear in a recovery key",
+            ));
+        }
+        if cleaned.len() != RECOVERY_BODY_CHARS + RECOVERY_CHECK_CHARS {
             return Err(Error::InvalidRecoveryKey(
                 "expected 56 characters (14 groups of 4)",
             ));
@@ -232,11 +233,8 @@ impl RecoveryKey {
         let decoded = Zeroizing::new(crockford_decode(body).ok_or(Error::InvalidRecoveryKey(
             "contains characters that cannot appear in a recovery key",
         ))?);
-        let mut key = Zeroizing::new([0u8; 32]);
-        if decoded.len() != key.len() {
-            return Err(Error::InvalidRecoveryKey("malformed key"));
-        }
-        key.copy_from_slice(&decoded);
+        let key: SecretBytes<32> =
+            SecretBytes::from_slice(&decoded).ok_or(Error::InvalidRecoveryKey("malformed key"))?;
         let check: Option<String> = check.chars().map(crockford_normalize).collect();
         if check.as_deref() != Some(checksum(&key).as_str()) {
             return Err(Error::InvalidRecoveryKey(
@@ -261,14 +259,14 @@ fn checksum(key: &[u8; 32]) -> String {
 #[cfg(test)]
 impl MasterKey {
     pub(crate) fn from_bytes_for_test(bytes: [u8; MASTER_KEY_LEN]) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self(SecretBytes::from_slice(&bytes).expect("exact length"))
     }
 }
 
 #[cfg(test)]
 impl RecoveryKey {
     pub(crate) fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self(SecretBytes::from_slice(&bytes).expect("exact length"))
     }
 }
 
@@ -294,6 +292,16 @@ mod tests {
         let typo: String = shown.into_iter().collect();
         assert!(matches!(
             RecoveryKey::parse(&typo),
+            Err(Error::InvalidRecoveryKey(_))
+        ));
+    }
+
+    #[test]
+    fn non_ascii_recovery_key_is_an_error_not_a_panic() {
+        // 56 characters but more than 56 bytes: used to split mid-character.
+        let input = format!("é{}", "0".repeat(55));
+        assert!(matches!(
+            RecoveryKey::parse(&input),
             Err(Error::InvalidRecoveryKey(_))
         ));
     }

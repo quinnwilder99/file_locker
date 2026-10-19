@@ -292,6 +292,258 @@ fn empty_folder_survives_losing_its_storage() {
     assert_eq!(vault.list("/box").unwrap()[0].name, "note.txt");
 }
 
+fn names(vault: &Vault, path: &str) -> Vec<String> {
+    vault
+        .list(path)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
+}
+
+fn storage_dirs(vault_dir: &Path) -> usize {
+    files_under(&vault_dir.join("d"))
+        .iter()
+        .filter(|p| p.is_dir() && p.parent().unwrap().parent().unwrap().ends_with("d"))
+        .count()
+}
+
+#[test]
+fn remove_files_and_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, vault_dir) = (tmp.path().join("src"), tmp.path().join("vault"));
+    sample_tree(&src);
+    let (vault, _) = Vault::create(&vault_dir, b"pw", TEST_KDF).unwrap();
+    let before = storage_dirs(&vault_dir);
+    vault.import(&src.join("secret-plans"), "/").unwrap();
+
+    let stats = vault.remove("/secret-plans/notes.txt").unwrap();
+    assert_eq!((stats.files, stats.dirs), (1, 0));
+    assert_eq!(names(&vault, "/secret-plans"), ["empty", "nested"]);
+
+    let stats = vault.remove("secret-plans").unwrap();
+    assert_eq!((stats.files, stats.dirs), (2, 4));
+    assert!(names(&vault, "/").is_empty());
+    assert_eq!(
+        storage_dirs(&vault_dir),
+        before,
+        "folder storage cleaned up"
+    );
+
+    assert!(matches!(vault.remove("/"), Err(Error::NotAllowed(_))));
+    assert!(matches!(vault.remove("/gone"), Err(Error::NotFound(_))));
+}
+
+#[test]
+fn rename_and_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, vault_dir, out) = (
+        tmp.path().join("src"),
+        tmp.path().join("vault"),
+        tmp.path().join("out"),
+    );
+    sample_tree(&src);
+    let (vault, _) = Vault::create(&vault_dir, b"pw", TEST_KDF).unwrap();
+    vault.import(&src.join("secret-plans"), "/").unwrap();
+    let long = "L".repeat(200);
+
+    // File: rename in place, to a long (shortened) name and back, then move folders.
+    vault
+        .rename("/secret-plans/notes.txt", "/secret-plans/Notes.TXT")
+        .unwrap();
+    vault
+        .rename("/secret-plans/Notes.TXT", &format!("/secret-plans/{long}"))
+        .unwrap();
+    vault
+        .rename(&format!("/secret-plans/{long}"), "/notes.txt")
+        .unwrap();
+    // Folder with contents: to a long name, then into another folder.
+    vault
+        .rename("/secret-plans/nested", &format!("/{long}"))
+        .unwrap();
+    vault
+        .rename(&format!("/{long}"), "/secret-plans/empty/nested")
+        .unwrap();
+
+    assert_eq!(names(&vault, "/"), ["notes.txt", "secret-plans"]);
+    assert_eq!(names(&vault, "/secret-plans"), ["empty"]);
+    vault.export("/", &out).unwrap();
+    assert_eq!(fs::read(out.join("notes.txt")).unwrap(), SECRET);
+    assert_eq!(
+        fs::read(out.join("secret-plans/empty/nested/Résumé 2026.docx")).unwrap(),
+        vec![0xAB; 200_000]
+    );
+    assert!(out
+        .join("secret-plans/empty/nested/deeper/empty.bin")
+        .is_file());
+
+    assert!(matches!(
+        vault.rename("/secret-plans", "/secret-plans/empty/inside"),
+        Err(Error::NotAllowed(_))
+    ));
+    assert!(matches!(
+        vault.rename("/notes.txt", "/secret-plans/empty"),
+        Err(Error::AlreadyExists(_))
+    ));
+    assert!(matches!(
+        vault.rename("/missing", "/x"),
+        Err(Error::NotFound(_))
+    ));
+    for path in files_under(&vault_dir) {
+        assert!(path.file_name().unwrap().len() <= 220);
+    }
+}
+
+#[test]
+fn import_replacing_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, vault_dir) = (tmp.path().join("src"), tmp.path().join("vault"));
+    sample_tree(&src);
+    let (vault, _) = Vault::create(&vault_dir, b"pw", TEST_KDF).unwrap();
+    vault.import(&src.join("secret-plans"), "/").unwrap();
+
+    // The CLI fallback workflow: export, edit, put back.
+    let edit = tmp.path().join("edit");
+    vault.export("/", &edit).unwrap();
+    fs::write(edit.join("secret-plans/notes.txt"), b"edited").unwrap();
+    fs::remove_dir_all(edit.join("secret-plans/nested")).unwrap();
+    fs::write(edit.join("secret-plans/added.txt"), b"new").unwrap();
+    vault
+        .import_replacing(&edit.join("secret-plans"), "/")
+        .unwrap();
+
+    assert_eq!(
+        names(&vault, "/secret-plans"),
+        ["added.txt", "empty", "notes.txt"]
+    );
+    let out = tmp.path().join("out");
+    vault.export("/secret-plans/notes.txt", &out).unwrap();
+    assert_eq!(fs::read(out.join("notes.txt")).unwrap(), b"edited");
+
+    // A single file, and a name that does not exist yet.
+    fs::write(edit.join("solo.txt"), b"one").unwrap();
+    vault.import_replacing(&edit.join("solo.txt"), "/").unwrap();
+    fs::write(edit.join("solo.txt"), b"two").unwrap();
+    vault.import_replacing(&edit.join("solo.txt"), "/").unwrap();
+    assert_eq!(names(&vault, "/"), ["secret-plans", "solo.txt"]);
+    assert_eq!(vault.list("/").unwrap()[1].size, Some(3));
+}
+
+#[test]
+fn single_entry_operations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let (vault, _) = Vault::create(&vault_dir, b"pw", TEST_KDF).unwrap();
+    let long = format!("{}.md", "Long Name ".repeat(20));
+
+    vault.create_dir("/Docs").unwrap();
+    vault.create_file("/Docs/Report.TXT").unwrap();
+    vault.create_file(&format!("/Docs/{long}")).unwrap();
+    assert!(matches!(
+        vault.create_file("/Docs/Report.TXT"),
+        Err(Error::AlreadyExists(_))
+    ));
+    assert!(matches!(
+        vault.open_file("/Docs"),
+        Err(Error::IsADirectory(_))
+    ));
+
+    let mut file = vault.open_file("/Docs/Report.TXT").unwrap();
+    file.write_at(0, b"hello").unwrap();
+    file.write_at(100_000, b"world").unwrap();
+    drop(file);
+    let entry = vault.stat("/Docs/Report.TXT").unwrap();
+    assert_eq!((entry.kind, entry.size), (EntryKind::File, Some(100_005)));
+    assert_eq!(vault.stat("/").unwrap().kind, EntryKind::Dir);
+    assert!(matches!(vault.stat("/nope"), Err(Error::NotFound(_))));
+
+    // Case-insensitive lookup returns the stored spelling, long names included.
+    assert_eq!(
+        vault.find("docs/report.txt").unwrap().as_deref(),
+        Some("/Docs/Report.TXT")
+    );
+    assert_eq!(
+        vault
+            .find(&format!("/DOCS/{}", long.to_uppercase()))
+            .unwrap(),
+        Some(format!("/Docs/{long}"))
+    );
+    assert_eq!(vault.find("/").unwrap().as_deref(), Some("/"));
+    assert_eq!(vault.find("/docs/missing").unwrap(), None);
+    assert_eq!(vault.find("/Docs/Report.TXT/below").unwrap(), None);
+
+    let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    vault
+        .set_times("/Docs/Report.TXT", Some(when), Some(when), Some(when))
+        .unwrap();
+    vault.set_times("/Docs", None, None, Some(when)).unwrap();
+    let entry = vault.stat("/Docs/Report.TXT").unwrap();
+    assert_eq!((entry.created, entry.modified), (when, when));
+    assert_eq!(vault.stat("/Docs").unwrap().modified, when);
+
+    // Rename-and-replace replaces files, never folders.
+    vault.create_file("/Docs/other.txt").unwrap();
+    assert!(matches!(
+        vault.rename("/Docs/other.txt", "/Docs/Report.TXT"),
+        Err(Error::AlreadyExists(_))
+    ));
+    vault
+        .rename_with("/Docs/other.txt", "/Docs/Report.TXT", true)
+        .unwrap();
+    assert_eq!(vault.stat("/Docs/Report.TXT").unwrap().size, Some(0));
+    vault.create_dir("/Other").unwrap();
+    assert!(matches!(
+        vault.rename_with("/Docs/Report.TXT", "/Other", true),
+        Err(Error::NotAllowed(_))
+    ));
+    vault
+        .rename_with("/Docs/Report.TXT", "/Docs/Report.TXT", true)
+        .unwrap();
+    // A case-only rename is a real rename.
+    vault
+        .rename("/Docs/Report.TXT", "/Docs/report.txt")
+        .unwrap();
+    assert_eq!(
+        names(&vault, "/Docs"),
+        [long.as_str(), "report.txt"].map(String::from)
+    );
+}
+
+#[test]
+fn case_insensitive_index_follows_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let (vault, _) = Vault::create(&vault_dir, b"pw", TEST_KDF).unwrap();
+    vault.create_dir("/Box").unwrap();
+    for i in 0..50 {
+        vault.create_file(&format!("/Box/File{i}.TXT")).unwrap();
+    }
+    assert_eq!(
+        vault.find("/box/file7.txt").unwrap().as_deref(),
+        Some("/Box/File7.TXT")
+    );
+
+    // This vault's own changes keep the index current.
+    vault.rename("/Box/File7.TXT", "/Box/Seven.txt").unwrap();
+    assert_eq!(vault.find("/box/file7.txt").unwrap(), None);
+    assert_eq!(
+        vault.find("/BOX/SEVEN.TXT").unwrap().as_deref(),
+        Some("/Box/Seven.txt")
+    );
+    vault.remove("/Box/File8.TXT").unwrap();
+    assert_eq!(vault.find("/box/file8.txt").unwrap(), None);
+
+    // A change made elsewhere (another process, a sync tool) is noticed once
+    // the folder's modification time moves.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let other = Vault::unlock(&vault_dir, b"pw").unwrap();
+    other.create_file("/Box/FromElsewhere.txt").unwrap();
+    assert_eq!(
+        vault.find("/box/fromelsewhere.TXT").unwrap().as_deref(),
+        Some("/Box/FromElsewhere.txt")
+    );
+}
+
 #[test]
 fn not_a_vault() {
     let tmp = tempfile::tempdir().unwrap();

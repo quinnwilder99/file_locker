@@ -6,13 +6,15 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-aes-gcm = "0.11"
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 aes-siv = "0.8"
-argon2 = "0.6"
+argon2 = { version = "0.6", features = ["zeroize"] }
 base64 = "0.23"
+# Not used directly: enables key-schedule zeroization inside aes-siv.
+cmac = { version = "0.8", features = ["zeroize"] }
 getrandom = "0.4"
 hkdf = "0.13"
-hmac = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -21,3 +23,7 @@ zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+# VirtualLock keeps key pages out of the pagefile.
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }

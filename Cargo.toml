@@ -1,8 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/vault-core", "crates/flk"]
+members = ["crates/vault-core", "crates/flk", "crates/flk-mount"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+# Optimize dependencies (crypto, Argon2) even in dev builds; tests and
+# debug mounts are otherwise very slow.
+[profile.dev.package."*"]
+opt-level = 3
