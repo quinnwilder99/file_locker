@@ -28,6 +28,11 @@ without full BitLocker.
   recoverable on disk (see Import).
 - File count, approximate sizes and directory shape are visible to someone with the vault folder
   (contents and names are not).
+- Copies Windows and apps make *outside* the vault while it is mounted: Explorer's thumbnail cache,
+  Recent files and jump lists, apps' own temp and autosave files, and the pagefile, all on the
+  (unencrypted, on Home editions) system drive. Entries on the mounted drive are marked "not
+  content indexed" so Windows Search skips them. BitLocker avoids this class of leak by encrypting
+  the whole system drive; a folder vault cannot.
 
 ## Architecture
 
@@ -185,6 +190,10 @@ How Windows semantics map onto the vault:
   refuses to archive a file whose index matches the archive's), so it must be unique; it changes
   when an entry is renamed.
 - **Timestamps** are the encrypted file's own NTFS times; setting them sets those.
+- **Renames follow NTFS:** an open file can be renamed and its handle keeps working; a folder
+  holding an open file cannot be renamed; rename-and-replace refuses folders and files that are
+  open elsewhere.
+- **Attributes:** every entry is reported "not content indexed" (see the threat model).
 
 Not stored (yet): file attributes such as hidden, read-only or system; ACLs; alternate data streams;
 reparse points and hard links.
@@ -210,8 +219,16 @@ open them on the mounted drive. This is a user choice; `flk` does not change Def
 
 Tested with real tools on a mounted vault (`crates/flk-mount/tests/real_tools.rs`): robocopy
 (multithreaded copy, byte-exact), git (commit, `gc --aggressive`, `fsck --full --strict`, checkout),
-Windows tar and 7-Zip (archive, test, extract, byte-exact). Not yet tested: Microsoft Office (not
-installed on the development machine) and interactive use in Explorer.
+Windows tar and 7-Zip (archive, test, extract, byte-exact).
+
+Application patterns (`crates/flk-mount/tests/app_patterns.rs`): Office-style safe save (write temp,
+swap by renames, delete backup), delete-on-close temp files, renames under open handles,
+memory-mapped writes, running an `.exe` from the drive, Explorer's copy engine
+(`Shell.Application.CopyHere`), a 1,200-entry listing, volume label and sizes, owner check, and
+damaged files (still listed; reading them fails and is logged).
+
+Not yet tested: Microsoft Office itself (not installed on the development machine; its save
+sequence is replayed above) and clicking through Explorer by hand.
 
 ## Open decisions
 
@@ -231,10 +248,12 @@ installed on the development machine) and interactive use in Explorer.
    writes, lost empty folders, remove/rename/replace, memory locking.
 2. **Mount** ✅ (2026-10-18): WinFsp file system over the core (`flk-mount`), `flk mount` with
    Ctrl+C to lock, random-access `VaultFile`, case-insensitive lookup with a per-folder index,
-   shared handles, rename-and-replace, delete-on-close. 52 tests in all, including a randomized
-   model test of `VaultFile`, a live mount driven through `std::fs`, real tools (robocopy, git,
-   tar, 7-Zip) and an end-to-end CLI test that locks with Ctrl+Break. Open items: Office and
-   Explorer testing by hand, attributes (see Open decisions), per-file overhead of ~4 ms.
+   shared handles, rename-and-replace, delete-on-close. Audited 2026-10-19 against every claim
+   above. 53 tests in all, including a randomized model test of `VaultFile`, a live mount driven
+   through `std::fs`, real tools (robocopy, git, tar, 7-Zip), application patterns (safe save,
+   memory maps, running programs, Explorer's copy engine, damaged files) and an end-to-end CLI test
+   that locks with Ctrl+Break. Open items: Office and Explorer by hand, attributes (see Open
+   decisions), per-file overhead of ~4 ms.
 3. **Desktop app:** tray icon, unlock dialog, auto-lock triggers, Explorer context menu, installer.
 4. **Hardening:** fuzz `vault.json` and file-header parsing, crash-consistency tests (power loss
    mid-write), external review of the crypto design before any 1.0.

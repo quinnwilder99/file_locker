@@ -45,7 +45,14 @@ fn mount_write_and_lock_with_ctrl_break() {
         return;
     };
     let mut child = Command::new(FLK)
-        .args(["--password-stdin", "mount", vault, "--drive", &drive])
+        // Typed sloppily on purpose ("t" for "T:"); flk normalizes it.
+        .args([
+            "--password-stdin",
+            "mount",
+            vault,
+            "--drive",
+            &drive.trim_end_matches(':').to_lowercase(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

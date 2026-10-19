@@ -19,6 +19,7 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const CLEANUP_DELETE: u32 = 0x01;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x2000;
 
 // NTSTATUS codes returned to Windows.
 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
@@ -434,7 +435,10 @@ impl FileSystemContext for VaultFs {
                 if !replace_if_exists {
                     return Err(nt(STATUS_OBJECT_NAME_COLLISION));
                 }
-                if self.vault.stat(&existing).map_err(to_nt)?.kind == EntryKind::Dir {
+                // Like NTFS: never replace a folder, or a file someone has open.
+                if self.vault.stat(&existing).map_err(to_nt)?.kind == EntryKind::Dir
+                    || self.open.lock().unwrap().contains_key(&fold(&existing))
+                {
                     return Err(nt(STATUS_ACCESS_DENIED));
                 }
                 self.vault.remove(&existing).map_err(to_nt)?;
@@ -544,11 +548,14 @@ impl FileSystemContext for VaultFs {
     }
 }
 
+/// Every entry is also marked not-content-indexed, so Windows Search does not
+/// copy vault contents into its (unencrypted) index on the system drive.
 fn attributes(kind: EntryKind) -> u32 {
-    match kind {
-        EntryKind::Dir => FILE_ATTRIBUTE_DIRECTORY,
-        EntryKind::File => FILE_ATTRIBUTE_ARCHIVE,
-    }
+    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        | match kind {
+            EntryKind::Dir => FILE_ATTRIBUTE_DIRECTORY,
+            EntryKind::File => FILE_ATTRIBUTE_ARCHIVE,
+        }
 }
 
 /// Describes `entry`, found at vault path `path`, to Windows.
