@@ -18,6 +18,7 @@ pub use win::free_drive_letter;
 pub struct MountedVault {
     host: FileSystemHost<fs::VaultFs>,
     mount_point: String,
+    open: fs::OpenTable,
 }
 
 #[derive(Debug)]
@@ -42,6 +43,11 @@ impl fmt::Display for MountError {
 impl std::error::Error for MountError {}
 
 /// Mounts `vault` at `mount_point`, such as `"V:"`.
+/// True if WinFsp is installed and its DLL loads.
+pub fn winfsp_available() -> bool {
+    winfsp::winfsp_init().is_ok()
+}
+
 pub fn mount(vault: Vault, mount_point: &str) -> Result<MountedVault, MountError> {
     winfsp::winfsp_init().map_err(|_| MountError::WinFspMissing)?;
     let failed = |what: &str, e: &dyn fmt::Debug| MountError::Failed(format!("{what}: {e:?}"));
@@ -53,6 +59,7 @@ pub fn mount(vault: Vault, mount_point: &str) -> Result<MountedVault, MountError
         .unwrap_or("Vault")
         .to_string();
     let context = fs::VaultFs::new(vault, label).map_err(|e| failed("security setup", &e))?;
+    let open = context.open_table();
 
     let mut params = VolumeParams::new();
     params
@@ -67,7 +74,11 @@ pub fn mount(vault: Vault, mount_point: &str) -> Result<MountedVault, MountError
         .case_preserved_names(true)
         .unicode_on_disk(true)
         .persistent_acls(true)
-        .post_cleanup_when_modified_only(true);
+        .post_cleanup_when_modified_only(true)
+        // Ask Windows to drop its cached view of a file as soon as the last
+        // program closes it. Otherwise the cache can keep files "open" for a
+        // while, which blocks a clean lock, and keeps plaintext in memory.
+        .flush_and_purge_on_cleanup(true);
 
     // Fine-grained guard: operations run concurrently; VaultFs locks internally.
     let mut host: FileSystemHost<fs::VaultFs, FineGuard> =
@@ -78,12 +89,22 @@ pub fn mount(vault: Vault, mount_point: &str) -> Result<MountedVault, MountError
     Ok(MountedVault {
         host,
         mount_point: mount_point.to_string(),
+        open,
     })
 }
 
 impl MountedVault {
     pub fn mount_point(&self) -> &str {
         &self.mount_point
+    }
+
+    /// Files with open handles, as paths on the drive (like `V:\Docs\a.txt`).
+    /// Folders are left out: Explorer keeps folders open all the time.
+    pub fn open_files(&self) -> Vec<String> {
+        fs::open_files(&self.open)
+            .into_iter()
+            .map(|p| format!("{}{}", self.mount_point, p.replace('/', "\\")))
+            .collect()
     }
 
     /// Removes the drive and locks the vault.

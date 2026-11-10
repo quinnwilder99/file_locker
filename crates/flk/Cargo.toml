@@ -10,6 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.5"
 flk-mount = { path = "../flk-mount" }
+log = "0.4"
 rpassword = "7"
 vault-core = { path = "../vault-core" }
 zeroize = "1"

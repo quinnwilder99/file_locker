@@ -171,6 +171,12 @@ impl Vault {
         Ok((vault, recovery))
     }
 
+    /// Checks that `root` holds a vault this version can open, without
+    /// unlocking it.
+    pub fn check(root: &Path) -> Result<()> {
+        VaultConfig::load(root).map(|_| ())
+    }
+
     pub fn unlock(root: &Path, password: &[u8]) -> Result<Vault> {
         let config = VaultConfig::load(root)?;
         let slot = config.slot(SlotKind::Password)?;

@@ -87,7 +87,28 @@ enum Command {
     Recover { vault: PathBuf },
 }
 
+/// Prints warnings from the mount layer (damaged files, I/O errors) to stderr.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("flk: {}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 fn main() -> ExitCode {
+    static LOGGER: StderrLogger = StderrLogger;
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

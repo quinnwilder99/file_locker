@@ -114,9 +114,10 @@ Rules:
 - **Create vault:** pick a folder + password → show recovery key → require the user to confirm it.
 - **Unlock:** tray icon or double-click the vault → password → mounts at the next free drive letter
   and opens Explorer.
-- **Lock:** tray menu, hotkey, or automatically on sleep, Windows lock, idle timeout, or USB
-  removal. Locking unmounts, then zeroizes keys. Open files are flushed first; if an app holds a
-  file open the user is told which app.
+- **Lock:** tray menu, hotkey, or automatically on sleep, Windows lock, idle timeout, sign-out, or
+  USB removal. Locking unmounts, then zeroizes keys. Writes reach the vault as they happen, so
+  nothing is waiting to be flushed; if an app holds a file open the user is told which file and
+  which app, and asked before a manual lock. Automatic locks do not ask.
 - **Import:** right-click a folder → "Move into vault". Copies into the vault, verifies, then deletes
   the originals. The UI warns that deleted originals may remain recoverable, especially on SSDs, and
   recommends creating sensitive files inside the vault from the start.
@@ -230,12 +231,62 @@ damaged files (still listed; reading them fails and is logged).
 Not yet tested: Microsoft Office itself (not installed on the development machine; its save
 sequence is replayed above) and clicking through Explorer by hand.
 
+The mount asks Windows to flush and purge its cache when the last handle to a file closes
+(`FlushAndPurgeOnCleanup`). Without it, the cache manager kept files referenced after programs
+closed them, so locking warned about files nobody had open; it also leaves less plaintext in the
+system cache.
+
+### Desktop app (`FileLocker.exe`)
+
+One process, no console window, three parts:
+
+- **UI thread** (Slint, Fluent style, follows Windows light/dark mode): the vault list, unlock,
+  create wizard (ending on the recovery-key page: copy / save to file / "I saved it" before
+  Finish), reset with recovery key, change password, settings, Move into vault, About. Windows
+  hide when closed; the app keeps running in the tray.
+- **Shell thread**: a hidden top-level window that owns the tray icon and menu and receives
+  `WM_WTSSESSION_CHANGE` (Windows lock), `WM_POWERBROADCAST` (sleep), `WM_ENDSESSION` (sign-out),
+  `WM_DEVICECHANGE` and a 5-second timer (vault folder gone, idle time), `WM_HOTKEY` (Ctrl+Alt+L)
+  and `WM_COPYDATA` from later launches. A message-only window would miss the broadcasts.
+- **Controller** (`app.rs`): the vault list, mounts, and every action, with errors as sentences.
+  Slow work (unlock ≈ 1 s by design, create, copy) runs on worker threads.
+
+Single instance: a named mutex; a second launch (double-clicked `Unlock vault.flkvault`,
+"Move into vault…", which Explorer starts once per selected item) forwards its command line to
+the running one and exits.
+
+Locking without force first re-checks open files for up to two seconds: antivirus scanners and
+the indexer open new files briefly, and those should not trigger a warning. If files stay open,
+the warning names them and, through the Restart Manager, the programs holding them. Auto-lock
+(sleep, Windows lock, idle, hotkey, sign-out, drive removed) never asks.
+
+"Move into vault" copies through the unlocked drive, verifies each file byte for byte against
+its original, and deletes an original only after its whole copy verified. Stopping or a failure
+removes the unfinished copy and keeps the original. Items containing links are copied but kept.
+
+Settings and the vault list live in `%APPDATA%\File Locker\settings.json` (no secrets); the log in
+`%LOCALAPPDATA%\File Locker\FileLocker.log`. Every new vault gets an `Unlock vault.flkvault` file.
+
+Installer (Inno Setup, `scripts\build-installer.ps1`): per-machine install, bundles the official
+WinFsp 2.1 MSI (SHA-256 checked at build time) and runs it only if WinFsp is missing, registers
+`.flkvault` and the "Move into vault…" verb for files and folders, optional start at sign-in,
+closes File Locker before upgrading or uninstalling, and leaves vaults and WinFsp in place on
+uninstall.
+
+GUI end-to-end tests (`scripts\gui-tests`) drive the real app through UI Automation: create a
+vault through the wizard, unlock / wrong password / lock, the open-files warning, hand-over from
+a second launch, settings and About, auto-lock on Windows lock, sleep, hotkey and folder removal,
+Move into vault (unlocking on the way), and the tray menu.
+
 ## Open decisions
 
 1. **Vault-format compatibility with Cryptomator.** The current format is our own (`.flk`), though
    structurally similar. Matching Cryptomator exactly would let users open vaults with an existing
    audited tool, at the cost of its KDF choice and recovery-key format.
-2. **WinFsp installation.** Bundle the official signed installer with ours, or require it separately.
+2. **WinFsp licensing before distributing.** WinFsp is GPLv3 with a FLOSS exception: File Locker
+   may bundle and use it if File Locker itself is released under an approved open-source licence;
+   a closed-source release needs a commercial WinFsp licence. The repository has no licence yet.
+   (Decided: the installer bundles WinFsp, installing it only when missing.)
 3. **Attributes.** Store hidden / read-only / system attributes (e.g. in the file header or a
    sidecar), or keep reporting every file as a plain archive file.
 
@@ -254,6 +305,12 @@ sequence is replayed above) and clicking through Explorer by hand.
    memory maps, running programs, Explorer's copy engine, damaged files) and an end-to-end CLI test
    that locks with Ctrl+Break. Open items: Office and Explorer by hand, attributes (see Open
    decisions), per-file overhead of ~4 ms.
-3. **Desktop app:** tray icon, unlock dialog, auto-lock triggers, Explorer context menu, installer.
+3. **Desktop app** ✅ (2026-11-10): `FileLocker.exe` (tray, windows, auto-lock on sleep / Windows
+   lock / idle / hotkey / sign-out / drive removal, open-file warnings naming programs, Move into
+   vault, double-click to unlock, single instance) and an Inno Setup installer bundling WinFsp.
+   9 app unit tests plus two GUI end-to-end suites. Not yet done: running the installer on a clean
+   machine (the development machine's permission policy blocked installing), code signing (so
+   Windows SmartScreen will warn on first run), a Windows 11 top-level context-menu entry (needs a
+   packaged shell extension; the classic entry is under "Show more options").
 4. **Hardening:** fuzz `vault.json` and file-header parsing, crash-consistency tests (power loss
    mid-write), external review of the crypto design before any 1.0.

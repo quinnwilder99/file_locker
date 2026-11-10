@@ -2,3 +2,6 @@
 lockdir/
 
 /target/
+
+# Installer output
+/dist/

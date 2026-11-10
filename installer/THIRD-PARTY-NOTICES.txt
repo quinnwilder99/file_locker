@@ -1,0 +1,19 @@
+File Locker includes or installs the following third-party software.
+
+WinFsp - Windows File System Proxy
+  https://winfsp.dev  /  source: https://github.com/winfsp/winfsp
+  Copyright (C) Bill Zissimopoulos
+  Licensed under the GNU General Public License version 3, with the WinFsp
+  FLOSS exception. The setup program installs the unmodified official WinFsp
+  installer (winfsp-2.1.25156.msi).
+
+Slint - user interface toolkit
+  https://slint.dev
+  Copyright (C) SixtyFPS GmbH
+  Used under the Slint Royalty-free Desktop, Mobile, and Web Applications
+  License 2.0. See the "About File Locker" window.
+
+RustCrypto (aes-gcm, aes-siv, argon2, hkdf, hmac, sha2, cmac),
+winfsp-rs, windows-sys, serde, rfd, zeroize, getrandom, and other Rust crates
+  Licensed under the MIT and/or Apache-2.0 licenses.
+  See https://crates.io for each crate's license text.

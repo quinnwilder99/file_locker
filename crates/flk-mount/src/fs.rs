@@ -59,7 +59,7 @@ fn to_nt(e: Error) -> FspError {
         code,
         STATUS_DATA_ERROR | STATUS_FILE_CORRUPT_ERROR | STATUS_UNSUCCESSFUL | 0
     ) {
-        eprintln!("flk: {e}");
+        log::warn!("{e}");
     }
     match e {
         Error::Io(io) => io.into(),
@@ -73,8 +73,11 @@ pub(crate) struct VaultFs {
     security: Vec<u8>,
     /// Every file or folder with open handles, by case-folded path. Handles
     /// to the same file share one `VaultFile`, so they agree on its length.
-    open: Mutex<HashMap<String, Arc<OpenEntry>>>,
+    open: OpenTable,
 }
+
+/// Shared with [`crate::MountedVault`], which reports open files before locking.
+pub(crate) type OpenTable = Arc<Mutex<HashMap<String, Arc<OpenEntry>>>>;
 
 pub(crate) struct OpenEntry {
     /// Current vault path, as stored; updated when it or a parent is renamed.
@@ -91,6 +94,19 @@ pub(crate) struct Handle {
     dir_buffer: DirBuffer,
 }
 
+/// Vault paths of files (not folders) that have open handles, sorted.
+pub(crate) fn open_files(table: &OpenTable) -> Vec<String> {
+    let mut files: Vec<String> = table
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|e| e.kind == EntryKind::File)
+        .map(|e| e.path.lock().unwrap().clone())
+        .collect();
+    files.sort();
+    files
+}
+
 impl Handle {
     fn path(&self) -> String {
         self.entry.path.lock().unwrap().clone()
@@ -98,12 +114,16 @@ impl Handle {
 }
 
 impl VaultFs {
+    pub(crate) fn open_table(&self) -> OpenTable {
+        self.open.clone()
+    }
+
     pub(crate) fn new(vault: Vault, label: String) -> io::Result<Self> {
         Ok(Self {
             vault,
             label,
             security: win::security_descriptor()?,
-            open: Mutex::new(HashMap::new()),
+            open: OpenTable::default(),
         })
     }
 
@@ -326,7 +346,7 @@ impl FileSystemContext for VaultFs {
         context.entry.file.lock().unwrap().take();
         let path = context.path();
         if let Err(e) = self.vault.remove(&path) {
-            eprintln!("flk: deleting {path}: {e}");
+            log::warn!("deleting {path}: {e}");
         }
     }
 

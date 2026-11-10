@@ -1,0 +1,29 @@
+[package]
+name = "flk-app"
+description = "File Locker: tray app for unlocking vaults as drives"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "FileLocker"
+path = "src/main.rs"
+
+[dependencies]
+flk-mount = { version = "0.1.0", path = "../flk-mount" }
+log = "0.4"
+raw-window-handle = "0.6"
+rfd = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slint = { version = "1.18", features = ["raw-window-handle-06"] }
+vault-core = { version = "0.1.0", path = "../vault-core" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_RemoteDesktop", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation", "Win32_System_DataExchange", "Win32_System_Threading", "Win32_System_RestartManager", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_System_Diagnostics_Debug", "Win32_System_Memory"] }
+zeroize = "1"
+
+[build-dependencies]
+embed-resource = "3"
+slint-build = "1.18"
+
+[dev-dependencies]
+tempfile = "3"
